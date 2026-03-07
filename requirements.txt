@@ -1,4 +1,4 @@
-# Facebook Ad Scraper — Python Dependencies (Render deployment)
+# Facebook Ad Scraper — Python Dependencies
 
 # Web framework (API server)
 fastapi==0.109.2
@@ -20,10 +20,6 @@ requests>=2.31.0
 
 # Environment variable management
 python-dotenv>=1.0.0
-
-# Audio processing support for Whisper (CPU-only)
-torch>=2.0.0
-torchaudio>=2.0.0
 
 # yt-dlp for fallback video downloads
 yt-dlp>=2024.1.0
