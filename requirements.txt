@@ -1,0 +1,30 @@
+# Facebook Ad Scraper — Python Dependencies (Render deployment)
+
+# Web framework (API server)
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+websockets>=12.0
+
+# Browser automation
+playwright==1.42.0
+
+# Video transcription (local Whisper — no API cost)
+openai-whisper==20231117
+
+# Video analysis
+opencv-python-headless==4.9.0.80
+numpy>=1.24.0
+
+# HTTP requests for video downloads
+requests>=2.31.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Audio processing support for Whisper (CPU-only to save space)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# yt-dlp for fallback video downloads
+yt-dlp>=2024.1.0
