@@ -2,6 +2,7 @@
 """
 FastAPI backend for the Facebook Ad Scraper web UI.
 Provides REST endpoints + WebSocket for real-time scrape progress.
+Uses Apify's Facebook Ad Library Scraper — no browser or login needed.
 """
 
 import os
@@ -33,7 +34,7 @@ from database import (
 
 # ── App Setup ─────────────────────────────────────────────
 
-app = FastAPI(title="Facebook Ad Scraper API", version="1.0.0")
+app = FastAPI(title="Facebook Ad Scraper API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,17 +66,16 @@ ws_connections: list[WebSocket] = []
 
 class ScrapeRequest(BaseModel):
     urls: List[str]
-    whisper_model: str = "medium"
-    delay: int = 3
+    count: int = 50          # Max ads to fetch per URL
+    whisper_model: str = "small"
+    delay: int = 1           # Delay between video downloads (seconds)
     min_duration: int = 0
     max_duration: int = 9999
     skip_transcribe: bool = False
-    headless: bool = True
 
 
 class SettingsUpdate(BaseModel):
-    fb_email: Optional[str] = None
-    fb_password: Optional[str] = None
+    apify_api_token: Optional[str] = None
     whisper_model: Optional[str] = None
     delay: Optional[int] = None
 
@@ -92,7 +92,7 @@ async def broadcast(message: dict):
     for ws in ws_connections:
         try:
             await ws.send_json(message)
-        except:
+        except Exception:
             dead.append(ws)
     for ws in dead:
         ws_connections.remove(ws)
@@ -182,7 +182,7 @@ async def start_scrape(request: ScrapeRequest):
     if scrape_state["running"]:
         raise HTTPException(status_code=409, detail="A scrape is already running")
 
-    # Clean and validate URLs
+    # Clean and validate URLs — accept Ad Library search URLs and Facebook page URLs
     urls = [u.strip() for u in request.urls if u.strip() and "facebook.com" in u.strip()]
     if not urls:
         raise HTTPException(status_code=400, detail="No valid Facebook URLs provided")
@@ -191,7 +191,7 @@ async def start_scrape(request: ScrapeRequest):
     scrape_state["running"] = True
     scrape_state["progress"] = []
     scrape_state["current_index"] = 0
-    scrape_state["total"] = len(urls)
+    scrape_state["total"] = 0  # Will be set once Apify returns results
     scrape_state["phase"] = "starting"
     scrape_state["completed_ads"] = []
 
@@ -206,7 +206,7 @@ async def start_scrape(request: ScrapeRequest):
     return {
         "status": "started",
         "total_urls": len(urls),
-        "message": f"Scraping {len(urls)} URLs...",
+        "message": f"Fetching ads from {len(urls)} URL(s) via Apify...",
     }
 
 
@@ -302,15 +302,13 @@ def get_settings():
                     key, val = line.split("=", 1)
                     env_data[key.strip()] = val.strip()
 
+    apify_token = settings.get("apify_api_token", env_data.get("APIFY_API_TOKEN", ""))
+
     return {
-        "fb_email": settings.get("fb_email", env_data.get("FB_EMAIL", "")),
-        "fb_password": settings.get("fb_password", env_data.get("FB_PASSWORD", "")),
-        "has_credentials": bool(
-            settings.get("fb_email", env_data.get("FB_EMAIL", ""))
-            and settings.get("fb_password", env_data.get("FB_PASSWORD", ""))
-        ),
-        "whisper_model": settings.get("whisper_model", "medium"),
-        "delay": int(settings.get("delay", "3")),
+        "apify_api_token": apify_token,
+        "has_credentials": bool(apify_token),
+        "whisper_model": settings.get("whisper_model", "small"),
+        "delay": int(settings.get("delay", "1")),
         "storage": get_storage_info(PROJECT_ROOT),
     }
 
@@ -319,56 +317,20 @@ def get_settings():
 def update_settings(request: SettingsUpdate):
     env_path = os.path.join(PROJECT_ROOT, ".env")
 
-    if request.fb_email is not None:
-        set_setting("fb_email", request.fb_email)
-    if request.fb_password is not None:
-        set_setting("fb_password", request.fb_password)
+    if request.apify_api_token is not None:
+        set_setting("apify_api_token", request.apify_api_token)
     if request.whisper_model is not None:
         set_setting("whisper_model", request.whisper_model)
     if request.delay is not None:
         set_setting("delay", str(request.delay))
 
-    # Also write to .env for the scraper modules
+    # Also write to .env so the scraper modules can pick it up via load_dotenv
     settings = get_all_settings()
     with open(env_path, "w") as f:
-        f.write(f"FB_EMAIL={settings.get('fb_email', '')}\n")
-        f.write(f"FB_PASSWORD={settings.get('fb_password', '')}\n")
+        f.write(f"APIFY_API_TOKEN={settings.get('apify_api_token', '')}\n")
+        f.write(f"WHISPER_MODEL={settings.get('whisper_model', 'small')}\n")
 
     return {"status": "saved"}
-
-
-@app.post("/api/settings/test-login")
-async def test_login():
-    """Test Facebook login with current credentials."""
-    settings = get_all_settings()
-    email = settings.get("fb_email", "")
-    password = settings.get("fb_password", "")
-
-    if not email or not password:
-        return {"success": False, "message": "No credentials configured"}
-
-    try:
-        from src.config import ScraperConfig
-        from src.scraper import FacebookScraper
-        from src.logger import ScrapeLogger
-
-        config = ScraperConfig()
-        config.fb_email = email
-        config.fb_password = password
-        config.headless = True
-
-        logger = ScrapeLogger(os.path.join(PROJECT_ROOT, "exports", "test"))
-        scraper = FacebookScraper(config, logger)
-        scraper.start_browser()
-        success = scraper.login()
-        scraper.close()
-
-        return {
-            "success": success,
-            "message": "Login successful" if success else "Login failed — check credentials",
-        }
-    except Exception as e:
-        return {"success": False, "message": f"Error: {str(e)}"}
 
 
 @app.delete("/api/data")
@@ -419,15 +381,22 @@ async def websocket_scrape(websocket: WebSocket):
 # ── Scrape Job Runner ─────────────────────────────────────
 
 def run_scrape_job(urls: list, request: ScrapeRequest):
-    """Background thread that runs the actual scraping."""
+    """
+    Background thread that runs the Apify-based scraping.
+
+    Flow:
+      1. Phase "fetching"  — call Apify API with all URLs, wait for results
+      2. Phase "processing" — for each returned ad, download video (if any),
+                              transcribe, and analyze locally
+      3. Phase "complete"  — report totals
+    """
     global scrape_state
 
-    # Get the running event loop for broadcasting
     import asyncio
     main_loop = None
     try:
         main_loop = asyncio.get_event_loop()
-    except:
+    except Exception:
         pass
 
     def emit(msg: dict):
@@ -437,87 +406,116 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
 
     try:
         from src.config import ScraperConfig
-        from src.scraper import FacebookScraper
+        from src.scraper import ApifyScraper
         from src.video_processor import VideoProcessor
         from src.transcriber import VideoTranscriber
         from src.video_analyzer import VideoAnalyzer
         from src.logger import ScrapeLogger
 
-        # Configure
+        # ── Configure ──────────────────────────────────────────
         config = ScraperConfig()
         settings = get_all_settings()
-        config.fb_email = settings.get("fb_email", config.fb_email)
-        config.fb_password = settings.get("fb_password", config.fb_password)
-        config.headless = request.headless
-        config.delay = request.delay
-        config.whisper_model = request.whisper_model
+
+        # Override with DB-stored settings
+        token = settings.get("apify_api_token", config.apify_api_token)
+        if token:
+            config.apify_api_token = token
+
+        config.delay = int(settings.get("delay", str(request.delay)))
+        config.whisper_model = settings.get("whisper_model", request.whisper_model)
         config.min_duration = request.min_duration
         config.max_duration = request.max_duration
 
         logger = ScrapeLogger(config.export_dir)
 
+        # Validate API token
+        if not config.apify_api_token:
+            emit({
+                "type": "error",
+                "message": "No Apify API token configured. Go to Settings and add your token.",
+            })
+            scrape_state["running"] = False
+            scrape_state["phase"] = "failed"
+            return
+
         # Initialize components
-        scraper = FacebookScraper(config, logger)
+        scraper = ApifyScraper(config, logger)
         video_proc = VideoProcessor(config, logger)
         analyzer = VideoAnalyzer(logger)
         transcriber = None
 
-        # Phase: Browser setup
-        scrape_state["phase"] = "login"
-        emit({"type": "phase", "phase": "login", "message": "Launching browser and logging in..."})
+        # ── Phase 1: Fetching from Apify ────────────────────────
+        scrape_state["phase"] = "fetching"
+        emit({
+            "type": "phase",
+            "phase": "fetching",
+            "message": f"Fetching ads from Apify for {len(urls)} URL(s)...",
+        })
 
-        scraper.start_browser()
-        if not scraper.login():
-            emit({"type": "error", "message": "Facebook login failed. Check credentials in Settings."})
+        raw_ads = scraper.fetch_ads(urls, count=request.count)
+
+        if not raw_ads:
+            emit({
+                "type": "error",
+                "message": "Apify returned no results. Check your URLs and API token.",
+            })
             scrape_state["running"] = False
             scrape_state["phase"] = "failed"
             scraper.close()
             return
 
-        emit({"type": "phase", "phase": "login_success", "message": "Logged in to Facebook"})
+        total_ads = len(raw_ads)
+        scrape_state["total"] = total_ads
+        emit({
+            "type": "fetched",
+            "total": total_ads,
+            "message": f"Apify returned {total_ads} ads. Processing...",
+        })
 
-        # Phase: Load Whisper
+        # ── Phase 2: Load Whisper (if needed) ──────────────────
         if not request.skip_transcribe:
             scrape_state["phase"] = "loading_whisper"
-            emit({"type": "phase", "phase": "loading_whisper", "message": f"Loading Whisper model ({request.whisper_model})..."})
-            transcriber = VideoTranscriber(request.whisper_model, logger)
+            emit({
+                "type": "phase",
+                "phase": "loading_whisper",
+                "message": f"Loading Whisper model ({config.whisper_model})...",
+            })
+            transcriber = VideoTranscriber(config.whisper_model, logger)
             if not transcriber.load_model():
                 emit({"type": "warning", "message": "Whisper unavailable — skipping transcription"})
                 transcriber = None
 
-        # Phase: Scraping
-        scrape_state["phase"] = "scraping"
+        # ── Phase 3: Process each ad ────────────────────────────
+        scrape_state["phase"] = "processing"
         successful = 0
         failed = 0
         videos = 0
         transcripts = 0
 
-        for i, url in enumerate(urls, 1):
+        for i, raw in enumerate(raw_ads, 1):
             scrape_state["current_index"] = i
 
             emit({
-                "type": "scraping",
+                "type": "processing",
                 "index": i,
-                "total": len(urls),
-                "url": url[:80],
-                "message": f"Scraping ad {i} of {len(urls)}...",
+                "total": total_ads,
+                "message": f"Processing ad {i} of {total_ads}...",
             })
 
-            # Scrape the URL
-            ad_data = scraper.scrape_url(url, i)
+            # Parse the raw Apify result into our standard format
+            ad_data = scraper.parse_ad(raw, i)
 
             if ad_data["scrape_status"] != "success":
                 failed += 1
                 emit({
                     "type": "ad_failed",
                     "index": i,
-                    "url": url[:80],
-                    "error": ad_data.get("error_message", "Unknown error"),
+                    "url": ad_data.get("source_url", "")[:80],
+                    "error": ad_data.get("error_message", "Parse error"),
                 })
-                # Still save to DB
+                # Still save to DB so user can see the failure
                 ad_data["scraped_at"] = datetime.now().isoformat()
                 insert_ad(ad_data)
-                time.sleep(1)
                 continue
 
             successful += 1
@@ -530,20 +528,24 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
                 "format": ad_data.get("ad_format", "Unknown"),
             })
 
-            # Video processing
+            # ── Video processing ────────────────────────────────
             if ad_data.get("ad_format") == "Video":
                 video_url = ad_data.pop("_video_download_url", "")
+                # Remove internal thumbnail URL before saving
+                ad_data.pop("_thumbnail_url", None)
+                ad_data.pop("_platforms", None)
+                ad_data.pop("_spend_range", None)
 
                 emit({
                     "type": "downloading",
                     "index": i,
-                    "total": len(urls),
-                    "message": f"Downloading video {i} of {len(urls)}...",
+                    "total": total_ads,
+                    "message": f"Downloading video {i} of {total_ads}...",
                 })
 
-                video_path = video_proc.download_video(video_url, i, advertiser)
-                if not video_path:
-                    video_path = video_proc.download_video_yt_dlp(url, i, advertiser)
+                video_path = ""
+                if video_url:
+                    video_path = video_proc.download_video(video_url, i, advertiser)
 
                 if video_path:
                     videos += 1
@@ -557,7 +559,7 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
                     # Duration filter
                     duration = video_info["duration"]
                     if request.min_duration <= duration <= request.max_duration:
-                        # Thumbnail
+                        # Thumbnail from first video frame
                         thumb_path = video_proc.extract_thumbnail(video_path, i)
                         if thumb_path:
                             ad_data["thumbnail_file_path"] = thumb_path
@@ -567,8 +569,8 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
                             emit({
                                 "type": "transcribing",
                                 "index": i,
-                                "total": len(urls),
-                                "message": f"Transcribing video {i} of {len(urls)}...",
+                                "total": total_ads,
+                                "message": f"Transcribing video {i} of {total_ads}...",
                             })
 
                             audio_path = video_proc.extract_audio(video_path)
@@ -587,22 +589,33 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
 
                                 video_proc.cleanup_audio(video_path)
                                 transcripts += 1
+                else:
+                    # Video URL was empty or download failed — log but continue
+                    emit({
+                        "type": "warning",
+                        "index": i,
+                        "message": f"Video download failed for ad {i} — saving metadata only",
+                    })
             else:
+                # Image ad — clean up internal fields before saving
                 ad_data.pop("_video_download_url", None)
+                ad_data.pop("_thumbnail_url", None)
+                ad_data.pop("_platforms", None)
+                ad_data.pop("_spend_range", None)
 
             # Save to database
             ad_data["scraped_at"] = datetime.now().isoformat()
             ad_id = insert_ad(ad_data)
             scrape_state["completed_ads"].append(ad_id)
 
-            # Delay between pages
-            if i < len(urls):
+            # Delay between video downloads to avoid hammering CDN
+            if i < total_ads and ad_data.get("ad_format") == "Video":
                 time.sleep(request.delay)
 
         # Cleanup
         scraper.close()
 
-        # Done
+        # ── Phase: Complete ─────────────────────────────────────
         scrape_state["phase"] = "complete"
         scrape_state["running"] = False
         emit({
@@ -611,7 +624,7 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
             "failed": failed,
             "videos": videos,
             "transcripts": transcripts,
-            "message": f"Done! {successful} scraped, {failed} failed, {transcripts} transcribed.",
+            "message": f"Done! {successful} ads saved, {failed} failed, {transcripts} transcribed.",
         })
 
     except Exception as e:

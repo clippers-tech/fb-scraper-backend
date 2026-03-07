@@ -5,10 +5,7 @@ fastapi==0.109.2
 uvicorn[standard]==0.27.1
 websockets>=12.0
 
-# Browser automation
-playwright==1.42.0
-
-# Video transcription — faster-whisper (no PyTorch needed, uses CTranslate2)
+# Video transcription — faster-whisper (no PyTorch needed)
 faster-whisper>=1.0.0
 
 # Video analysis
@@ -20,6 +17,3 @@ requests>=2.31.0
 
 # Environment
 python-dotenv>=1.0.0
-
-# Video downloads
-yt-dlp>=2024.1.0

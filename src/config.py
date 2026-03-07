@@ -14,9 +14,8 @@ load_dotenv()
 class ScraperConfig:
     """All configuration options for the scraper."""
 
-    # Facebook credentials
-    fb_email: str = ""
-    fb_password: str = ""
+    # Apify API token
+    apify_api_token: str = ""
 
     # File paths
     links_file: str = "links.txt"
@@ -24,23 +23,20 @@ class ScraperConfig:
     export_dir: str = ""
     videos_dir: str = ""
     thumbnails_dir: str = ""
-    browser_data_dir: str = ""
 
     # Scraping options
-    headless: bool = True
-    delay: int = 3
+    delay: int = 1
     max_retries: int = 2
 
     # Video options
     skip_transcribe: bool = False
-    whisper_model: str = "medium"
+    whisper_model: str = "small"
     min_duration: int = 0
     max_duration: int = 9999
 
     def __post_init__(self):
-        # Load credentials from environment
-        self.fb_email = os.getenv("FB_EMAIL", "")
-        self.fb_password = os.getenv("FB_PASSWORD", "")
+        # Load API token from environment
+        self.apify_api_token = os.getenv("APIFY_API_TOKEN", "")
 
         # Set up directory paths
         if not self.base_dir:
@@ -50,24 +46,16 @@ class ScraperConfig:
         self.export_dir = os.path.join(self.base_dir, "exports", today)
         self.videos_dir = os.path.join(self.base_dir, "videos")
         self.thumbnails_dir = os.path.join(self.base_dir, "thumbnails")
-        self.browser_data_dir = os.path.join(self.base_dir, "browser_data")
 
         # Create all directories
-        for d in [self.export_dir, self.videos_dir, self.thumbnails_dir, self.browser_data_dir]:
+        for d in [self.export_dir, self.videos_dir, self.thumbnails_dir]:
             os.makedirs(d, exist_ok=True)
 
     def validate(self) -> list:
         """Return list of validation errors, empty if valid."""
         errors = []
-        if not self.fb_email:
-            errors.append("FB_EMAIL not set in .env file")
-        if not self.fb_password:
-            errors.append("FB_PASSWORD not set in .env file")
-
-        links_path = os.path.join(self.base_dir, self.links_file)
-        if not os.path.exists(links_path):
-            errors.append(f"{self.links_file} not found. Create it with one Facebook URL per line.")
-
+        if not self.apify_api_token:
+            errors.append("APIFY_API_TOKEN not set — add it in Settings")
         return errors
 
 
