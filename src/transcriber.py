@@ -1,5 +1,5 @@
 """
-Video transcription using OpenAI Whisper (local, open source).
+Video transcription using faster-whisper (CTranslate2 backend — no PyTorch needed).
 Generates word-level timestamps and groups them into natural sentence segments.
 """
 
@@ -10,7 +10,7 @@ from .logger import ScrapeLogger
 
 
 class VideoTranscriber:
-    """Transcribes video audio using local Whisper model."""
+    """Transcribes video audio using local Whisper model via faster-whisper."""
 
     def __init__(self, model_name: str, logger: ScrapeLogger):
         self.model_name = model_name
@@ -20,15 +20,19 @@ class VideoTranscriber:
     def load_model(self):
         """Load the Whisper model. Called once at startup."""
         try:
-            import whisper
+            from faster_whisper import WhisperModel
             self.logger.info(f"Loading Whisper model: {self.model_name}")
             self.logger.info("(First run will download the model, this may take a few minutes)")
-            self.model = whisper.load_model(self.model_name)
+            self.model = WhisperModel(
+                self.model_name,
+                device="cpu",
+                compute_type="int8",
+            )
             self.logger.success(f"Whisper model '{self.model_name}' loaded")
             return True
         except ImportError:
             self.logger.error(
-                "OpenAI Whisper not installed. Run: pip install openai-whisper"
+                "faster-whisper not installed. Run: pip install faster-whisper"
             )
             return False
         except Exception as e:
@@ -67,47 +71,49 @@ class VideoTranscriber:
         try:
             self.logger.info("Transcribing audio with Whisper...")
 
-            # Run Whisper with word-level timestamps
-            whisper_result = self.model.transcribe(
+            # Run faster-whisper with word-level timestamps
+            segments_gen, info = self.model.transcribe(
                 audio_path,
                 word_timestamps=True,
                 language=None,  # Auto-detect
                 task="transcribe",
-                verbose=False,
             )
 
             # Extract detected language
-            result["language"] = whisper_result.get("language", "en")
+            result["language"] = info.language or "en"
 
-            # Extract full transcript
-            result["full_transcript"] = whisper_result.get("text", "").strip()
+            # Collect all segments and words
+            all_text_parts = []
+            words = []
+
+            for segment in segments_gen:
+                all_text_parts.append(segment.text.strip())
+                if segment.words:
+                    for word_info in segment.words:
+                        words.append({
+                            "word": word_info.word.strip(),
+                            "start": word_info.start,
+                            "end": word_info.end,
+                        })
+
+            result["full_transcript"] = " ".join(all_text_parts).strip()
+            result["words"] = words
 
             if not result["full_transcript"]:
                 self.logger.warning("No speech detected in audio")
                 return result
 
-            # Extract word-level timestamps
-            words = []
-            for segment in whisper_result.get("segments", []):
-                for word_info in segment.get("words", []):
-                    words.append({
-                        "word": word_info.get("word", "").strip(),
-                        "start": word_info.get("start", 0),
-                        "end": word_info.get("end", 0),
-                    })
-            result["words"] = words
-
             # Group words into natural sentence segments (2-5 seconds each)
-            segments = self._group_into_segments(words)
-            result["segments"] = segments
+            grouped_segments = self._group_into_segments(words)
+            result["segments"] = grouped_segments
 
             # Format timestamped transcript
-            result["timestamped_transcript"] = self._format_timestamped(segments)
+            result["timestamped_transcript"] = self._format_timestamped(grouped_segments)
 
             word_count = len(result["full_transcript"].split())
             self.logger.success(
                 f"Transcription complete: {word_count} words, "
-                f"{len(segments)} segments, "
+                f"{len(grouped_segments)} segments, "
                 f"language: {result['language']}"
             )
 

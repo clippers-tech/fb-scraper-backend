@@ -1,34 +1,18 @@
 FROM python:3.11-slim
 
-# Install system dependencies for Playwright and OpenCV
+# Install system dependencies for Playwright, FFmpeg, and audio processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    curl \
     ffmpeg \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    libatspi2.0-0 \
+    curl \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+    libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install CPU-only PyTorch first (smaller)
-RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# Copy and install Python dependencies
+# Copy requirements and install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
