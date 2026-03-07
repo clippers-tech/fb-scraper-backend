@@ -21,8 +21,7 @@ requests>=2.31.0
 # Environment variable management
 python-dotenv>=1.0.0
 
-# Audio processing support for Whisper (CPU-only to save space)
---extra-index-url https://download.pytorch.org/whl/cpu
+# Audio processing support for Whisper (CPU-only)
 torch>=2.0.0
 torchaudio>=2.0.0
 
