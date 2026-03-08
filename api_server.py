@@ -302,7 +302,7 @@ def get_settings():
                     key, val = line.split("=", 1)
                     env_data[key.strip()] = val.strip()
 
-    apify_token = settings.get("apify_api_token", env_data.get("APIFY_API_TOKEN", ""))
+    apify_token = settings.get("apify_api_token", "") or env_data.get("APIFY_API_TOKEN", "") or os.getenv("APIFY_API_TOKEN", "")
 
     return {
         "apify_api_token": apify_token,
@@ -416,8 +416,8 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
         config = ScraperConfig()
         settings = get_all_settings()
 
-        # Override with DB-stored settings
-        token = settings.get("apify_api_token", config.apify_api_token)
+        # Override with DB-stored settings (prefer DB, fall back to env var)
+        token = settings.get("apify_api_token", "") or config.apify_api_token or os.getenv("APIFY_API_TOKEN", "")
         if token:
             config.apify_api_token = token
 
