@@ -177,13 +177,66 @@ def serve_thumbnail(ad_id: int):
 
 # ── Scrape Endpoints ─────────────────────────────────────
 
+def normalize_facebook_urls(raw_urls: list) -> list:
+    """
+    Convert various Facebook URL formats into Ad Library-compatible URLs.
+    
+    Handles:
+    - Ad Library search URLs (pass through as-is)
+    - Individual post URLs → extract page ID → convert to Ad Library page URL
+    - Page URLs → convert to Ad Library page URL
+    """
+    import re
+    normalized = []
+    seen_page_ids = set()
+
+    for url in raw_urls:
+        url = url.strip()
+        if not url or "facebook.com" not in url:
+            continue
+
+        # Already an Ad Library URL — pass through
+        if "/ads/library" in url:
+            normalized.append(url)
+            continue
+
+        # Individual post URL: /PAGE_ID/posts/POST_ID or /permalink/POST_ID
+        post_match = re.search(r'facebook\.com/(\d+)/posts/', url)
+        if not post_match:
+            post_match = re.search(r'facebook\.com/([^/]+)/posts/', url)
+        
+        if post_match:
+            page_id = post_match.group(1)
+            if page_id not in seen_page_ids:
+                seen_page_ids.add(page_id)
+                # Convert to Ad Library URL for this page
+                ad_lib_url = f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&view_all_page_id={page_id}&search_type=page"
+                normalized.append(ad_lib_url)
+            continue
+
+        # Page URL (e.g. facebook.com/Nike or facebook.com/profile.php?id=123)
+        page_id_match = re.search(r'profile\.php\?id=(\d+)', url)
+        if page_id_match:
+            page_id = page_id_match.group(1)
+            if page_id not in seen_page_ids:
+                seen_page_ids.add(page_id)
+                ad_lib_url = f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&view_all_page_id={page_id}&search_type=page"
+                normalized.append(ad_lib_url)
+            continue
+
+        # Generic page URL — pass through (Apify can handle page URLs)
+        normalized.append(url)
+
+    return normalized
+
+
 @app.post("/api/scrape")
 async def start_scrape(request: ScrapeRequest):
     if scrape_state["running"]:
         raise HTTPException(status_code=409, detail="A scrape is already running")
 
-    # Clean and validate URLs — accept Ad Library search URLs and Facebook page URLs
-    urls = [u.strip() for u in request.urls if u.strip() and "facebook.com" in u.strip()]
+    # Normalize URLs — convert post URLs to Ad Library page URLs
+    urls = normalize_facebook_urls(request.urls)
     if not urls:
         raise HTTPException(status_code=400, detail="No valid Facebook URLs provided")
 
@@ -472,18 +525,8 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
             "message": f"Apify returned {total_ads} ads. Processing...",
         })
 
-        # ── Phase 2: Load Whisper (if needed) ──────────────────
-        if not request.skip_transcribe:
-            scrape_state["phase"] = "loading_whisper"
-            emit({
-                "type": "phase",
-                "phase": "loading_whisper",
-                "message": f"Loading Whisper model ({config.whisper_model})...",
-            })
-            transcriber = VideoTranscriber(config.whisper_model, logger)
-            if not transcriber.load_model():
-                emit({"type": "warning", "message": "Whisper unavailable — skipping transcription"})
-                transcriber = None
+        # ── Phase 2: Whisper will be loaded lazily on first video ad ──
+        whisper_loaded = False
 
         # ── Phase 3: Process each ad ────────────────────────────
         scrape_state["phase"] = "processing"
@@ -563,6 +606,25 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
                         thumb_path = video_proc.extract_thumbnail(video_path, i)
                         if thumb_path:
                             ad_data["thumbnail_file_path"] = thumb_path
+
+                        # Lazy-load Whisper on first video (saves RAM until needed)
+                        if not request.skip_transcribe and not whisper_loaded:
+                            whisper_loaded = True
+                            scrape_state["phase"] = "loading_whisper"
+                            emit({
+                                "type": "phase",
+                                "phase": "loading_whisper",
+                                "message": f"Loading Whisper model ({config.whisper_model})...",
+                            })
+                            try:
+                                transcriber = VideoTranscriber(config.whisper_model, logger)
+                                if not transcriber.load_model():
+                                    emit({"type": "warning", "message": "Whisper unavailable — skipping transcription"})
+                                    transcriber = None
+                            except Exception as we:
+                                emit({"type": "warning", "message": f"Whisper failed to load: {str(we)} — skipping transcription"})
+                                transcriber = None
+                            scrape_state["phase"] = "processing"
 
                         # Transcription
                         if transcriber:
