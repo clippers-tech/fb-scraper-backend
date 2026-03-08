@@ -177,57 +177,17 @@ def serve_thumbnail(ad_id: int):
 
 # ── Scrape Endpoints ─────────────────────────────────────
 
-def normalize_facebook_urls(raw_urls: list) -> list:
+def validate_facebook_urls(raw_urls: list) -> list:
     """
-    Convert various Facebook URL formats into Ad Library-compatible URLs.
-    
-    Handles:
-    - Ad Library search URLs (pass through as-is)
-    - Individual post URLs → extract page ID → convert to Ad Library page URL
-    - Page URLs → convert to Ad Library page URL
+    Validate and clean Facebook URLs. Accepts both Ad Library and post URLs.
+    Returns only valid facebook.com URLs.
     """
-    import re
-    normalized = []
-    seen_page_ids = set()
-
+    cleaned = []
     for url in raw_urls:
         url = url.strip()
-        if not url or "facebook.com" not in url:
-            continue
-
-        # Already an Ad Library URL — pass through
-        if "/ads/library" in url:
-            normalized.append(url)
-            continue
-
-        # Individual post URL: /PAGE_ID/posts/POST_ID or /permalink/POST_ID
-        post_match = re.search(r'facebook\.com/(\d+)/posts/', url)
-        if not post_match:
-            post_match = re.search(r'facebook\.com/([^/]+)/posts/', url)
-        
-        if post_match:
-            page_id = post_match.group(1)
-            if page_id not in seen_page_ids:
-                seen_page_ids.add(page_id)
-                # Convert to Ad Library URL for this page
-                ad_lib_url = f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&view_all_page_id={page_id}&search_type=page"
-                normalized.append(ad_lib_url)
-            continue
-
-        # Page URL (e.g. facebook.com/Nike or facebook.com/profile.php?id=123)
-        page_id_match = re.search(r'profile\.php\?id=(\d+)', url)
-        if page_id_match:
-            page_id = page_id_match.group(1)
-            if page_id not in seen_page_ids:
-                seen_page_ids.add(page_id)
-                ad_lib_url = f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&view_all_page_id={page_id}&search_type=page"
-                normalized.append(ad_lib_url)
-            continue
-
-        # Generic page URL — pass through (Apify can handle page URLs)
-        normalized.append(url)
-
-    return normalized
+        if url and "facebook.com" in url:
+            cleaned.append(url)
+    return cleaned
 
 
 @app.post("/api/scrape")
@@ -235,8 +195,8 @@ async def start_scrape(request: ScrapeRequest):
     if scrape_state["running"]:
         raise HTTPException(status_code=409, detail="A scrape is already running")
 
-    # Normalize URLs — convert post URLs to Ad Library page URLs
-    urls = normalize_facebook_urls(request.urls)
+    # Validate URLs — accept both Ad Library and individual post URLs
+    urls = validate_facebook_urls(request.urls)
     if not urls:
         raise HTTPException(status_code=400, detail="No valid Facebook URLs provided")
 
@@ -438,10 +398,11 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
     Background thread that runs the Apify-based scraping.
 
     Flow:
-      1. Phase "fetching"  — call Apify API with all URLs, wait for results
-      2. Phase "processing" — for each returned ad, download video (if any),
+      1. Classify URLs into Ad Library vs individual post URLs
+      2. Phase "fetching"  — call appropriate Apify actor(s), wait for results
+      3. Phase "processing" — for each returned result, download video (if any),
                               transcribe, and analyze locally
-      3. Phase "complete"  — report totals
+      4. Phase "complete"  — report totals
     """
     global scrape_state
 
@@ -497,17 +458,46 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
         analyzer = VideoAnalyzer(logger)
         transcriber = None
 
-        # ── Phase 1: Fetching from Apify ────────────────────────
-        scrape_state["phase"] = "fetching"
+        # ── Classify URLs ─────────────────────────────────────
+        classified = scraper.classify_urls(urls)
+        ad_lib_urls = classified["ad_library"]
+        post_urls = classified["posts"]
+
         emit({
             "type": "phase",
-            "phase": "fetching",
-            "message": f"Fetching ads from Apify for {len(urls)} URL(s)...",
+            "phase": "classifying",
+            "message": f"Classified {len(urls)} URL(s): {len(ad_lib_urls)} Ad Library, {len(post_urls)} individual post(s)",
         })
 
-        raw_ads = scraper.fetch_ads(urls, count=request.count)
+        # ── Phase 1: Fetching from Apify ────────────────────────
+        scrape_state["phase"] = "fetching"
 
-        if not raw_ads:
+        # Collect (raw_result, parse_method) tuples
+        raw_results = []  # list of (raw_dict, "ad" | "post")
+
+        # Fetch Ad Library results
+        if ad_lib_urls:
+            emit({
+                "type": "phase",
+                "phase": "fetching",
+                "message": f"Fetching ads from Ad Library for {len(ad_lib_urls)} URL(s)...",
+            })
+            ad_items = scraper.fetch_ads(ad_lib_urls, count=request.count)
+            for item in ad_items:
+                raw_results.append((item, "ad"))
+
+        # Fetch individual post results
+        if post_urls:
+            emit({
+                "type": "phase",
+                "phase": "fetching",
+                "message": f"Fetching {len(post_urls)} individual post(s) via Posts Scraper...",
+            })
+            post_items = scraper.fetch_posts(post_urls)
+            for item in post_items:
+                raw_results.append((item, "post"))
+
+        if not raw_results:
             emit({
                 "type": "error",
                 "message": "Apify returned no results. Check your URLs and API token.",
@@ -517,36 +507,39 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
             scraper.close()
             return
 
-        total_ads = len(raw_ads)
+        total_ads = len(raw_results)
         scrape_state["total"] = total_ads
         emit({
             "type": "fetched",
             "total": total_ads,
-            "message": f"Apify returned {total_ads} ads. Processing...",
+            "message": f"Apify returned {total_ads} result(s). Processing...",
         })
 
         # ── Phase 2: Whisper will be loaded lazily on first video ad ──
         whisper_loaded = False
 
-        # ── Phase 3: Process each ad ────────────────────────────
+        # ── Phase 3: Process each result ────────────────────────
         scrape_state["phase"] = "processing"
         successful = 0
         failed = 0
         videos = 0
         transcripts = 0
 
-        for i, raw in enumerate(raw_ads, 1):
+        for i, (raw, result_type) in enumerate(raw_results, 1):
             scrape_state["current_index"] = i
 
             emit({
                 "type": "processing",
                 "index": i,
                 "total": total_ads,
-                "message": f"Processing ad {i} of {total_ads}...",
+                "message": f"Processing {'post' if result_type == 'post' else 'ad'} {i} of {total_ads}...",
             })
 
-            # Parse the raw Apify result into our standard format
-            ad_data = scraper.parse_ad(raw, i)
+            # Parse with the appropriate method based on URL type
+            if result_type == "post":
+                ad_data = scraper.parse_post(raw, i)
+            else:
+                ad_data = scraper.parse_ad(raw, i)
 
             if ad_data["scrape_status"] != "success":
                 failed += 1
