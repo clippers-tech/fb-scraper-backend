@@ -12,6 +12,7 @@ import time
 import json
 import requests
 from html import unescape
+from xml.etree import ElementTree
 from .config import ScraperConfig, AD_DATA_TEMPLATE
 from .logger import ScrapeLogger
 
@@ -377,26 +378,39 @@ class ApifyScraper:
             ad_data["ad_format"] = "Video" if is_video else "Image"
 
             if is_video:
-                # Try to get video URL from media
                 video_url = ""
+                audio_url = ""
                 thumb_url = ""
+                duration_ms = 0
+
                 for m in media:
                     if m.get("__typename") == "Video":
-                        # Direct video URL may not be available — thumbnail always is
+                        # Thumbnail
                         thumb_img = m.get("thumbnailImage", {}) or {}
                         thumb_url = thumb_img.get("uri", m.get("thumbnail", "")) or ""
-                        # Some responses include playable_url
+
+                        # Duration from metadata
+                        duration_ms = m.get("playable_duration_in_ms", 0) or 0
+
+                        # Try direct playable URL first
                         video_url = m.get("playable_url", m.get("playable_url_quality_hd", "")) or ""
+
+                        # If no direct URL, extract from DASH manifest
+                        if not video_url:
+                            legacy = m.get("videoDeliveryLegacyFields", {}) or {}
+                            dash_xml = legacy.get("dash_manifest_xml_string", "")
+                            if dash_xml:
+                                extracted = self._extract_dash_urls(dash_xml)
+                                video_url = extracted.get("video_url", "")
+                                audio_url = extracted.get("audio_url", "")
                         break
 
                 ad_data["_video_download_url"] = video_url
+                ad_data["_audio_download_url"] = audio_url
                 ad_data["_thumbnail_url"] = thumb_url
-
-                # If no direct video URL, try the post link (it's a video page)
-                if not video_url:
-                    link = raw.get("link", raw.get("url", ""))
-                    if link and "/videos/" in link:
-                        ad_data["_video_download_url"] = link
+                if duration_ms > 0:
+                    secs = duration_ms / 1000
+                    ad_data["_duration_hint"] = secs
             else:
                 # Image ad — mark video fields
                 video_fields = [
@@ -427,6 +441,80 @@ class ApifyScraper:
             ad_data["error_message"] = f"Parse error: {str(e)}"
 
         return ad_data
+
+    def _extract_dash_urls(self, dash_xml: str) -> dict:
+        """
+        Parse a DASH manifest XML and extract the best video and audio URLs.
+        DASH manifests from Facebook contain separate video/audio streams
+        with direct fbcdn.net CDN URLs in <BaseURL> elements.
+        """
+        result = {"video_url": "", "audio_url": ""}
+
+        try:
+            # Unescape HTML entities
+            xml_str = unescape(dash_xml)
+
+            # Use regex to extract representations (more robust than XML parsing
+            # since the manifest may have namespace issues)
+            reps = re.findall(
+                r'<Representation([^>]+)>.*?<BaseURL>([^<]+)</BaseURL>',
+                xml_str,
+                re.DOTALL,
+            )
+
+            best_video_bw = 0
+            best_audio_bw = 0
+
+            for attrs, base_url in reps:
+                base_url = unescape(base_url.strip())
+
+                # Determine bandwidth
+                bw_match = re.search(r'bandwidth="(\d+)"', attrs)
+                bw = int(bw_match.group(1)) if bw_match else 0
+
+                # Determine codec to distinguish video vs audio
+                codecs_match = re.search(r'codecs="([^"]+)"', attrs)
+                codecs = codecs_match.group(1) if codecs_match else ""
+
+                is_audio = "mp4a" in codecs.lower() or "audio" in codecs.lower()
+
+                if is_audio:
+                    if bw > best_audio_bw:
+                        best_audio_bw = bw
+                        result["audio_url"] = base_url
+                else:
+                    # For video, pick a reasonable quality (720p-ish)
+                    # to balance download time vs quality on 512MB server
+                    width_match = re.search(r'width="(\d+)"', attrs)
+                    width = int(width_match.group(1)) if width_match else 0
+
+                    # Prefer ~720p for balance, but take best available up to 720p
+                    # If only higher res available, take the lowest one above 720p
+                    if width <= 720 and bw > best_video_bw:
+                        best_video_bw = bw
+                        result["video_url"] = base_url
+
+            # If no video <= 720p found, take the lowest bandwidth video available
+            if not result["video_url"]:
+                for attrs, base_url in reps:
+                    codecs_match = re.search(r'codecs="([^"]+)"', attrs)
+                    codecs = codecs_match.group(1) if codecs_match else ""
+                    if "mp4a" not in codecs.lower():
+                        bw_match = re.search(r'bandwidth="(\d+)"', attrs)
+                        bw = int(bw_match.group(1)) if bw_match else 0
+                        if not result["video_url"] or bw < best_video_bw:
+                            best_video_bw = bw
+                            result["video_url"] = unescape(base_url.strip())
+
+            if result["video_url"]:
+                self.logger.info("Extracted video URL from DASH manifest")
+            if result["audio_url"]:
+                self.logger.info("Extracted audio URL from DASH manifest")
+
+        except Exception as e:
+            self.logger.warning(f"DASH manifest parse error: {str(e)}")
+
+        return result
 
     def close(self):
         """No cleanup needed for API-based scraper."""

@@ -567,6 +567,8 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
             # ── Video processing ────────────────────────────────
             if ad_data.get("ad_format") == "Video":
                 video_url = ad_data.pop("_video_download_url", "")
+                audio_url = ad_data.pop("_audio_download_url", "")
+                duration_hint = ad_data.pop("_duration_hint", 0)
                 # Remove internal thumbnail URL before saving
                 ad_data.pop("_thumbnail_url", None)
                 ad_data.pop("_platforms", None)
@@ -580,7 +582,10 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
                 })
 
                 video_path = ""
-                if video_url:
+                if video_url and audio_url:
+                    # DASH video — separate video + audio streams
+                    video_path = video_proc.download_dash_video(video_url, audio_url, i, advertiser)
+                elif video_url:
                     video_path = video_proc.download_video(video_url, i, advertiser)
 
                 if video_path:
@@ -654,6 +659,8 @@ def run_scrape_job(urls: list, request: ScrapeRequest):
             else:
                 # Image ad — clean up internal fields before saving
                 ad_data.pop("_video_download_url", None)
+                ad_data.pop("_audio_download_url", None)
+                ad_data.pop("_duration_hint", None)
                 ad_data.pop("_thumbnail_url", None)
                 ad_data.pop("_platforms", None)
                 ad_data.pop("_spend_range", None)

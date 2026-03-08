@@ -137,6 +137,112 @@ class VideoProcessor:
             self.logger.error(f"yt-dlp error: {str(e)}")
             return ""
 
+    def download_dash_video(self, video_url: str, audio_url: str, index: int, advertiser_name: str) -> str:
+        """
+        Download DASH video + audio streams separately, then mux with ffmpeg.
+        Facebook DASH manifests provide separate video/audio CDN URLs.
+        Returns local file path or empty string on failure.
+        """
+        if not video_url:
+            self.logger.warning("No DASH video URL available")
+            return ""
+
+        safe_name = re.sub(r'[^\w\s-]', '', advertiser_name).strip().replace(' ', '-')[:50]
+        if not safe_name:
+            safe_name = "unknown"
+
+        filepath = os.path.join(self.config.videos_dir, f"ad_{index:03d}_{safe_name}.mp4")
+        video_tmp = os.path.join(self.config.videos_dir, f"_tmp_video_{index:03d}.mp4")
+        audio_tmp = os.path.join(self.config.videos_dir, f"_tmp_audio_{index:03d}.m4a")
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.facebook.com/",
+        }
+
+        try:
+            # Download video stream
+            self.logger.info(f"Downloading DASH video stream...")
+            resp = requests.get(video_url, headers=headers, stream=True, timeout=120)
+            resp.raise_for_status()
+            with open(video_tmp, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            video_size = os.path.getsize(video_tmp)
+            if video_size < 10000:
+                self.logger.warning(f"Video stream too small ({video_size} bytes)")
+                self._cleanup_tmp(video_tmp, audio_tmp)
+                return ""
+
+            # Download audio stream (if available)
+            has_audio = False
+            if audio_url:
+                self.logger.info(f"Downloading DASH audio stream...")
+                try:
+                    resp = requests.get(audio_url, headers=headers, stream=True, timeout=60)
+                    resp.raise_for_status()
+                    with open(audio_tmp, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    if os.path.getsize(audio_tmp) > 1000:
+                        has_audio = True
+                except Exception as e:
+                    self.logger.warning(f"Audio stream download failed: {str(e)}")
+
+            # Mux video + audio with ffmpeg
+            if has_audio:
+                self.logger.info("Muxing video + audio streams...")
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_tmp,
+                    "-i", audio_tmp,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-movflags", "+faststart",
+                    filepath,
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+                if result.returncode != 0 or not os.path.exists(filepath):
+                    self.logger.warning(f"ffmpeg mux failed: {result.stderr[:200]}")
+                    # Fall back to video-only
+                    os.rename(video_tmp, filepath)
+            else:
+                # Video only — just rename
+                os.rename(video_tmp, filepath)
+
+            self._cleanup_tmp(video_tmp, audio_tmp)
+
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 10000:
+                size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                self.logger.success(f"DASH video saved: ad_{index:03d}_{safe_name}.mp4 ({size_mb:.1f} MB)")
+                return filepath
+
+            return ""
+
+        except Exception as e:
+            self.logger.error(f"DASH video download failed: {str(e)}")
+            self._cleanup_tmp(video_tmp, audio_tmp)
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            return ""
+
+    def _cleanup_tmp(self, *paths):
+        """Remove temporary files."""
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except:
+                    pass
+
     def extract_thumbnail(self, video_path: str, index: int) -> str:
         """Extract first frame from video as thumbnail."""
         if not video_path or not os.path.exists(video_path):
